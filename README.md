@@ -43,27 +43,24 @@ pip install -e ".[docs,test]"
 
 ## Quick Start
 
-Once installed, the BayesWave pipeline is automatically available in Asimov. Add it to your production configuration:
+Once installed, the BayesWave pipeline is automatically available in Asimov. 
+To add a new bayeswave analysis you can create a blueprint YAML file like the following:
 
 ```yaml
-name: GW150914
-productions:
-- Prod0:
-    pipeline: bayeswave
-    comment: PSD generation with BayesWave
-    status: wait
-    meta:
-      likelihood:
-        sample rate: 2048
-        segment length: 8
-      data:
-        channels:
-          H1: H1:GDS-CALIB_STRAIN
-          L1: L1:GDS-CALIB_STRAIN
-      quality:
-        minimum frequency:
-          H1: 20
-          L1: 20
+kind: analysis
+pipeline: bayeswave
+comment: PSD generation with BayesWave
+likelihood:
+  sample rate: 2048
+  segment length: 8
+data:
+  channels:
+    H1: H1:GDS-CALIB_STRAIN
+    L1: L1:GDS-CALIB_STRAIN
+quality:
+  minimum frequency:
+    H1: 20
+    L1: 20
 ```
 
 ## Usage
