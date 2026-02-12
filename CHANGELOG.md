@@ -19,13 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive test suite
 - Sphinx documentation with kentigern theme
 - GitHub Actions CI/CD workflows
+- `[asimov]` optional dependency group for explicit asimov integration
 
 ### Changed
 - Extracted BayesWave integration from Asimov core into standalone plugin
 - Removed deprecation warning from Asimov 0.6
+- Updated version constraint to require asimov>=0.7
+- Added installation instructions for asimov[gw]
 
 ### Fixed
-- N/A
+- Updated dependency constraint to support asimov 0.7 (changed from `asimov>=0.6.0` to `asimov>=0.7`)
 
 ## [0.1.0] - TBD
 

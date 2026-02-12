@@ -21,6 +21,16 @@ This package provides a plugin for Asimov 0.7+ that enables integration with the
 
 ## Installation
 
+### Via Asimov (Recommended)
+
+If you have asimov 0.7+, you can install gravitational wave pipelines including bayeswave with:
+
+```bash
+pip install asimov[gw]
+```
+
+This will automatically install asimov-bayeswave and other GW analysis plugins.
+
 ### From PyPI (when released)
 
 ```bash

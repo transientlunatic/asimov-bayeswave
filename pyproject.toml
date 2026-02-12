@@ -31,11 +31,14 @@ classifiers = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "asimov>=0.6.0",
+    "asimov>=0.7",
     "numpy",
 ]
 
 [project.optional-dependencies]
+asimov = [
+    "asimov>=0.7",
+]
 docs = [
     "sphinx",
     "kentigern >= 0.3.0",
