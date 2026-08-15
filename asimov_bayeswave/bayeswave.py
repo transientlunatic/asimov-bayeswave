@@ -324,7 +324,7 @@ class BayesWave(Pipeline):
         float
             The minimum frequency across all interferometers.
         """
-        return min(self.production.meta["quality"]["minimum frequency"].values())
+        return min(self.production.meta.get("likelihood", {}).get("minimum frequency", 0).values())
 
     def before_submit(self):
         """
