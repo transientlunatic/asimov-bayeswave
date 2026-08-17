@@ -1,0 +1,50 @@
+# A minimal event for the asimov-bayeswave end-to-end test. This uses real
+# (trimmed, ~32s) GW150914 H1 GWOSC strain -- see
+# tests/test_data/frames/H-H1_GWOSC_16KHZ_R1-1126259447-32.gwf -- rather
+# than simulated noise, since bayeswave_pipe's own `--skip-datafind` /
+# cache-files mechanism (used here) is the most direct way to hand it real
+# frame data without depending on an external datafind server or the
+# separate asimov-gwdata plugin.
+#
+# `data.cache files.H1` is deliberately NOT set here: its value is an
+# absolute filesystem path (a LAL-cache-format file pointing at the frame
+# above), which only exists once the CI checkout lands somewhere, so it
+# can't be a static value in this file. The `H1_CACHE_FILE_PLACEHOLDER`
+# token below is substituted for the real path by e2e.yml (a plain `sed`
+# replacement into a temporary copy of this file) immediately before it's
+# applied -- applying a second `kind: event` blueprint for an
+# already-registered event name does not merge fields (confirmed while
+# developing this test: asimov reports "already exists" and silently
+# ignores the second apply), so the whole event has to be defined in one
+# shot rather than layering a cache-path patch on top afterwards.
+kind: event
+name: FAKE_BAYESWAVE_TEST_EVENT
+interferometers:
+- H1
+event time: 1126259462.391000032
+likelihood:
+  sample rate: 2048
+  segment length: 4
+  window length: 4
+  psd length: 4
+  roll off time: 1
+  segment start: 1126259460.391000032
+  minimum frequency:
+    H1: 20
+data:
+  segment length: 4
+  channels:
+    H1: H1:GWOSC-16KHZ_R1_STRAIN
+  frame types:
+    H1: H1_GWOSC_16KHZ_R1
+  cache files:
+    H1: H1_CACHE_FILE_PLACEHOLDER
+scheduler:
+  accounting group: ligo.dev.o4.cbc.pe.bayeswave
+  # Deliberately small: this is the real, hand-validated setting that a
+  # genuine BayesWave clean+post run against 4s of real H1 strain (Niter
+  # 25000, Nchain 4, Nthreads 4 -- see bayeswave_production.yaml) needs on
+  # a shared GitHub Actions runner; the ini template's own bundled default
+  # (8192 MB / 16384 MB) is sized for real production analyses.
+  request memory: 1024
+  request post memory: 2048

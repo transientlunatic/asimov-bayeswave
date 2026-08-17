@@ -1,0 +1,308 @@
+name: End-to-end test (real bayeswave_pipe)
+
+on:
+  push:
+    branches: ['**']
+    tags: ['*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: "BayesWave end-to-end test (HTCondor)"
+    runs-on: ubuntu-latest
+    container:
+      image: htcondor/mini:latest
+      options: --privileged
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: etive-io/actions/setup-htcondor@v1
+
+      - name: Install base tools
+        run: |
+          yum install -y sudo git
+
+      - name: Create submit user
+        uses: etive-io/actions/create-submit-user@v1
+
+      - name: Ensure submituser can access workspace
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/e2e_project"
+          chmod -R a+rwX "$GITHUB_WORKSPACE"
+
+      - name: Setup asimov-bayeswave Environment
+        uses: ./.github/actions/setup-bayeswave-env
+        with:
+          python-version: "3.11"
+
+      - name: Set up git
+        run: |
+          su - submituser <<SUBMITUSER
+          set -euo pipefail
+          git config --global init.defaultBranch master
+          git config --global user.email "you@example.com"
+          git config --global user.name "Your Name"
+          SUBMITUSER
+
+      - name: Create asimov project
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: cd e2e_project && asimov init "E2E Test Project"
+
+      - name: Configure asimov environment and condor user
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: |
+            cd e2e_project
+            if [ -z "$CONDA_PREFIX" ] || [ ! -x "$CONDA_PREFIX/bin/bayeswave_pipe" ]; then
+              echo "::error::CONDA_PREFIX ('$CONDA_PREFIX') does not contain bin/bayeswave_pipe" >&2
+              exit 1
+            fi
+            asimov configuration update pipelines/environment "$CONDA_PREFIX"
+            asimov configuration update condor/user submituser
+
+      - name: Diagnose asimov.pipelines entry-point discovery as submituser
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: |
+            python3 -c "
+            from importlib.metadata import entry_points
+            eps = [ep for ep in entry_points(group='asimov.pipelines') if ep.value.startswith('asimov_bayeswave')]
+            print('Discovered asimov_bayeswave entry points:', eps)
+            for ep in eps:
+                try:
+                    ep.load()
+                    print(f'  {ep.name}: loaded OK')
+                except Exception as e:
+                    print(f'  {ep.name}: FAILED TO LOAD: {e!r}')
+            "
+
+      # BayesWave needs no fake upstream pipeline (unlike LALInference/
+      # bilby, which read PSDs *from* an upstream BayesWave production):
+      # it's itself the upstream PSD-estimation step, and runs directly
+      # against real strain data via bayeswave_pipe's own --skip-datafind /
+      # cache-files mechanism. This uses real (trimmed, ~32s) GW150914 H1
+      # GWOSC strain vendored into tests/test_data/frames/ -- the same
+      # frame file asimov core's own (pre-plugin-extraction)
+      # htcondor-tests.yml used successfully -- rather than the separate
+      # asimov-gwdata plugin or a mock datafind server: gwdata's real
+      # upstream (git.ligo.org/asimov/pipelines/gwdata) isn't reachable
+      # without LIGO auth from a public GitHub Actions runner (confirmed:
+      # a plain HTTPS clone attempt gets 403), and its public GitHub
+      # mirror (github.com/etive-io/asimov-gwdata) doesn't carry the fix
+      # branch core's CI used -- so a hand-written LAL-format cache file
+      # pointing straight at the vendored frame is both simpler and more
+      # robust here.
+      #
+      # data.cache files.H1 is an absolute path that only exists once this
+      # checkout has landed somewhere, so it can't be a static value in
+      # tests/test_blueprints/fake_event.yaml -- see that file for why the
+      # placeholder is substituted rather than layering a second `kind:
+      # event` apply on top (the latter doesn't merge; asimov silently
+      # no-ops a second apply of an existing event name).
+      - name: Generate the LAL-cache fixture and apply the fake event
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: |
+            cd e2e_project
+            mkdir -p cache
+            printf 'H\tH1_GWOSC_16KHZ_R1\t1126259447\t32\tfile://localhost%s/tests/test_data/frames/H-H1_GWOSC_16KHZ_R1-1126259447-32.gwf\n' \
+              "$GITHUB_WORKSPACE" > cache/H1.cache
+            sed "s|H1_CACHE_FILE_PLACEHOLDER|$PWD/cache/H1.cache|" \
+              "$GITHUB_WORKSPACE/tests/test_blueprints/fake_event.yaml" > /tmp/fake_event_resolved.yaml
+            asimov apply -f /tmp/fake_event_resolved.yaml
+
+      # Real, hand-validated settings (see tests/test_blueprints/
+      # bayeswave_production.yaml for the full rationale): a genuine
+      # bayeswave_pipe -> BayesWave -> BayesWavePost run against 4 seconds
+      # of real H1 strain, Niter=25000/Nchain=4/Nthreads=4, completes in
+      # well under a minute. The ini itself is rendered from
+      # asimov_bayeswave's bundled config_template via the real `asimov
+      # manage build` command below -- not pre-seeded -- which is itself a
+      # regression check for a real bug found putting this test together
+      # (BayesWave had no config_template property at all).
+      - name: Add and build the real BayesWave production
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: |
+            cd e2e_project
+            asimov apply -f "$GITHUB_WORKSPACE/tests/test_blueprints/bayeswave_production.yaml" -e FAKE_BAYESWAVE_TEST_EVENT
+            asimov manage build submit
+
+      - name: Inspect the generated DAG
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: |
+            cd e2e_project
+            find working/FAKE_BAYESWAVE_TEST_EVENT/generate-psd -maxdepth 1
+            echo "--- generate-psd.dag ---"
+            cat working/FAKE_BAYESWAVE_TEST_EVENT/generate-psd/generate-psd.dag
+            # A real bayeswave_pipe-generated DAG: BayesWave (clean) ->
+            # BayesWavePost -> megaplot, not a stub.
+            grep -q "bayeswave.sub" working/FAKE_BAYESWAVE_TEST_EVENT/generate-psd/generate-psd.dag
+            grep -q "bayeswave_post.sub" working/FAKE_BAYESWAVE_TEST_EVENT/generate-psd/generate-psd.dag
+
+      # This is the real completion criterion asimov_bayeswave's
+      # detect_completion()/collect_assets() check for -- not a smoke-test
+      # proxy. Reaching it means bayeswave_pipe genuinely built a working
+      # DAG, HTCondor genuinely ran it end to end (BayesWave -> BayesWavePost,
+      # a real RJMCMC clean run against real strain), and the post step
+      # produced a real, parseable glitch-subtracted PSD.
+      - name: Wait for real PSD output
+        uses: etive-io/actions/wait-for-files@v1
+        with:
+          patterns: "trigtime_*/post/clean/glitch_median_PSD_forLI_H1.dat"
+          directory: "working/FAKE_BAYESWAVE_TEST_EVENT/generate-psd"
+          timeout: "600"
+          interval: "15"
+          working-directory: "e2e_project"
+
+      - name: Verify the PSD file is genuinely parseable
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: |
+            cd e2e_project
+            python3 -c "
+            import glob
+            paths = glob.glob('working/FAKE_BAYESWAVE_TEST_EVENT/generate-psd/trigtime_*/post/clean/glitch_median_PSD_forLI_H1.dat')
+            assert paths, 'No PSD file found'
+            rows = 0
+            with open(paths[0]) as f:
+                for line in f:
+                    freq, psd = line.split()
+                    freq, psd = float(freq), float(psd)
+                    assert freq >= 0, f'Negative frequency: {freq}'
+                    assert psd > 0, f'Non-positive PSD value: {psd}'
+                    rows += 1
+            assert rows > 100, f'Suspiciously few PSD rows: {rows}'
+            print(f'PSD file genuinely parseable: {rows} rows, e.g. {paths[0]}')
+            "
+
+      # The megaplot DAG node (a child of bayeswave_post in the DAG) runs
+      # independently of asimov's own PSD-file polling above, but by the
+      # time the steps above have finished it will normally have already
+      # completed too. Wait for it explicitly (short timeout, since it's
+      # already very likely done) so the after_completion()/collect_pages()
+      # check below exercises a genuinely complete run rather than racing
+      # the DAG's last node. Note the glob lives in `patterns`, not
+      # `directory` -- wait-for-files double-quotes `directory` internally,
+      # which suppresses shell glob expansion of anything inside it, so a
+      # wildcard there matches nothing; `patterns` is expanded unquoted and
+      # does support this, matching how the PSD wait step above already
+      # relies on a nested trigtime_*/... glob inside its own pattern.
+      - name: Wait for megaplot output
+        uses: etive-io/actions/wait-for-files@v1
+        with:
+          patterns: "trigtime_*/index.html"
+          directory: "working/FAKE_BAYESWAVE_TEST_EVENT/generate-psd"
+          timeout: "120"
+          interval: "10"
+          working-directory: "e2e_project"
+
+      - name: Run asimov monitor for the BayesWave production
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: cd e2e_project && asimov monitor
+
+      # Regression check for the two most severe bugs this e2e test found
+      # (see CHANGELOG.md): (1) build_dag() unconditionally called
+      # RunConfiguration methods (_get_user/update_accounting/set_queue/
+      # save) that no longer exist on the trimmed-down asimov>=0.7
+      # RunConfiguration, so it crashed for essentially any production with
+      # a real event repository; (2) collect_assets() called
+      # os.path.exists() on a bare list whenever a detector's PSD glob had
+      # no matches yet, crashing detect_completion() on every single
+      # monitoring poll prior to completion. Both are only reachable
+      # through the real CLI + real polling loop, not direct Python calls,
+      # which is exactly why they survived the pre-existing (fully mocked)
+      # unit test suite. Confirm asimov considers the production genuinely
+      # finished, not stuck.
+      - name: Confirm the production reached a finished/uploaded state
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: |
+            cd e2e_project
+            python3 -c "
+            import yaml
+            with open('.asimov/ledger.yml') as f:
+                ledger = yaml.safe_load(f)
+            event = next(e for e in ledger['events'] if e['name'] == 'FAKE_BAYESWAVE_TEST_EVENT')
+            production = next(p['generate-psd'] for p in event['productions'] if 'generate-psd' in p)
+            status = production.get('status')
+            print('generate-psd status:', status)
+            assert status in ('finished', 'uploaded'), f'Unexpected status: {status}'
+            "
+
+      # after_completion()'s PSD->XML conversion step calls
+      # convert_psd_ascii2xml, which -- as discovered while developing this
+      # test -- is not shipped by any current public conda-forge package
+      # (bayeswave, bayeswaveutils, lalinference and lalapps were all
+      # checked; only BayesWaveToLALPSD, a different tool with a
+      # substantially different calling convention, ships in `bayeswave`
+      # itself). This is deliberately NOT worked around: after_completion()
+      # already catches the resulting PipelineException, logs it, and
+      # continues on to store the ascii-format PSD regardless (see
+      # asimov_bayeswave/bayeswave.py). This step is the real regression
+      # check for that graceful-degradation behaviour, and for the
+      # `_convert_psd` stderr=STDOUT bug fix (previously, failure could
+      # never actually be detected at all -- see CHANGELOG.md) now
+      # correctly raising instead of silently mis-reporting success.
+      - name: Verify graceful handling of the missing convert_psd_ascii2xml tool
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: |
+            cd e2e_project
+            # logs/asimov.log is the project's central log (confirmed by
+            # direct inspection while developing this test -- asimov's own
+            # per-production log directory under logs/<event>/<production>/
+            # exists but this plugin's rarely-used collect_logs() is the
+            # only thing that ever reads it, nothing writes an asimov.log
+            # there during normal operation).
+            test -f logs/asimov.log || { echo "::error::No asimov.log found"; exit 1; }
+            grep -qi "Failed to convert the PSDs to XML" logs/asimov.log
+            echo "Confirmed: PSD->XML conversion failure was logged and handled gracefully, not left uncaught."
+
+      - name: Verify the ascii-format PSD was stored despite the XML conversion failure
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: |
+            cd e2e_project
+            find results -iname "*psd*" 2>/dev/null
+            find results -iname "*H1*" -iname "*psd*" | grep -q . || { echo "::error::No stored PSD asset found under results/"; exit 1; }
+
+      - name: Verify the megaplot HTML output was collected
+        uses: etive-io/actions/run-asimov-command@v1
+        with:
+          script: |
+            cd e2e_project
+            # collect_pages() (called from after_completion()) copies
+            # megaplot's output to the configured webroot; BayesWave.html()
+            # references plots/clean_whitened_residual_histograms.png
+            # directly, so confirm that specific file genuinely exists,
+            # not just that *some* plot was produced.
+            find pages/FAKE_BAYESWAVE_TEST_EVENT/generate-psd -maxdepth 2
+            test -f "pages/FAKE_BAYESWAVE_TEST_EVENT/generate-psd/index.html"
+            test -f "pages/FAKE_BAYESWAVE_TEST_EVENT/generate-psd/plots/clean_whitened_residual_histograms.png"
+
+      - name: Archive artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-debug
+          path: |
+            e2e_project/.asimov/
+            e2e_project/working/
+            e2e_project/checkouts/
+            e2e_project/pages/
+            e2e_project/logs/
+          retention-days: 5

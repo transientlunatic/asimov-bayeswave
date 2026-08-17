@@ -1,0 +1,30 @@
+# Test blueprint for the real BayesWave production under test. Its ini is
+# rendered from asimov_bayeswave's own bundled config_template (see
+# BayesWave.config_template / asimov_bayeswave/configs/bayeswave.ini) via
+# the real `asimov manage build` command -- unlike asimov-lalinference's
+# e2e test, which pre-seeds a hand-written ini directly (LALInference has
+# no config_template of its own to exercise). Exercising the real
+# config_template rendering path here is itself part of what this e2e test
+# validates, since a missing config_template property was one of the real
+# bugs found putting this test together (see CHANGELOG.md).
+#
+# `likelihood.iterations`/`chains`/`threads` here are the real,
+# hand-validated "quick" BayesWave settings -- confirmed by running
+# bayeswave_pipe -> BayesWave -> BayesWavePost directly (no asimov
+# involved) against 4 seconds of real GW150914 H1 GWOSC strain before this
+# blueprint was written: a real `--cleanOnly` RJMCMC clean run at these
+# settings completes in single-digit seconds, and the post-processing merge
+# step (BayesWavePost) in a further ~1s, producing a genuine, parseable
+# glitch_median_PSD_forLI_H1.dat -- the same completion criterion
+# detect_completion() itself checks for, and the same settings the asimov
+# core repository's own (pre-plugin-extraction) htcondor-tests.yml CI used
+# successfully for the equivalent step.
+kind: analysis
+name: generate-psd
+pipeline: bayeswave
+comment: BayesWave end-to-end test production (real H1 GWOSC strain, reduced sampler settings)
+status: ready
+likelihood:
+  iterations: 25000
+  chains: 4
+  threads: 4

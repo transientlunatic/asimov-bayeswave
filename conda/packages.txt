@@ -1,0 +1,2 @@
+conda-forge::bayeswave
+conda-forge::bayeswaveutils
