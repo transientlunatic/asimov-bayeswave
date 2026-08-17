@@ -14,10 +14,15 @@ This package provides a plugin for Asimov 0.7+ that enables integration with the
 - 🔌 **Plugin Architecture**: Seamlessly integrates with Asimov via entry points
 - 📊 **PSD Generation**: Automatic power spectral density estimation and collection
 - 🔄 **Format Conversion**: Converts PSDs to XML format for use with other pipelines
-- 🚀 **HTCondor Integration**: Automated DAG generation and job submission
+  (where `convert_psd_ascii2xml` is available — see "Operational notes" below)
+- 🚀 **Scheduler-agnostic**: Automated DAG generation and job submission via Asimov's
+  HTCondor/Slurm scheduler API
 - 📈 **Result Collection**: Automatic collection of megaplot outputs and visualizations
 - 🎯 **PSD Suppression**: Support for suppressing frequency bands in PSDs
-- 🧪 **Well Tested**: Comprehensive unit test coverage
+- 🧪 **Well Tested**: Unit tests plus a genuine end-to-end test (real `bayeswave_pipe` DAG
+  generation and HTCondor execution — `BayesWave`, `BayesWavePost`, `megaplot.py` — against
+  real GW150914 H1 GWOSC strain, waiting for a real, parseable
+  `glitch_median_PSD_forLI_H1.dat`, not a smoke test)
 
 ## Installation
 
@@ -111,7 +116,38 @@ xml_psds = assets["xml psds"]
 - Python >= 3.9
 - asimov >= 0.7.0
 - numpy
-- BayesWave (must be installed separately)
+- BayesWave (must be installed separately) — via conda-forge:
+  ```bash
+  conda install -c conda-forge bayeswave bayeswaveutils
+  ```
+  `bayeswave` ships the compiled samplers (`BayesWave`, `BayesWavePost`, ...);
+  `bayeswave_pipe` (the DAG-generation script this plugin's `build_dag()` shells out to)
+  and `megaplot.py`/`megasky.py` come from the separate `bayeswaveutils` package. Unlike
+  the sibling `asimov-lalinference` plugin, no `numpy<2` pin is needed — the current
+  conda-forge `bayeswaveutils` build's `megaplot.py` has already been patched for numpy
+  2.0.
+
+## Operational notes
+
+### `convert_psd_ascii2xml` is not available from public conda-forge packages
+
+`after_completion()` tries to convert each ascii-format PSD to XML via a
+`convert_psd_ascii2xml` executable. As of this writing that tool is not shipped by any
+current public conda-forge package — `bayeswave`, `bayeswaveutils`, `lalinference` and
+`lalapps` were all checked while building this plugin's end-to-end test, and none of them
+provide it (it may only exist in older or IGWN-internal environments). `bayeswave` does
+ship a `BayesWaveToLALPSD` executable that looks like a plausible modern replacement, but
+its calling convention (positional run name, requires `--gnuplot` output enabled during
+the original run, reads specific paths under `waveforms/`) is substantially different and
+has not been validated here.
+
+This is handled gracefully rather than worked around: `after_completion()` catches the
+resulting `PipelineException`, logs it, and continues on to store the ascii-format PSD via
+`store_assets()` regardless (see `collect_assets()["psds"]`). If your environment does
+have a working `convert_psd_ascii2xml`, XML-format PSD conversion and storage will work as
+documented above with no changes needed. If not, downstream pipelines that specifically
+need an XML-format PSD (rather than the ascii format) won't get one from this plugin until
+someone wires up `BayesWaveToLALPSD` (or an equivalent) as a real replacement.
 
 ## Documentation
 
@@ -128,7 +164,7 @@ The built documentation will be in `docs/build/html/`.
 
 ## Testing
 
-Run the test suite with:
+Run the unit test suite with:
 
 ```bash
 pytest
@@ -139,6 +175,19 @@ For coverage reporting:
 ```bash
 pytest --cov=asimov_bayeswave --cov-report=html
 ```
+
+### End-to-end test
+
+`.github/workflows/e2e.yml` runs a genuine end-to-end test on real GitHub Actions
+infrastructure: a real `bayeswave_pipe` DAG (`BayesWave` clean run -> `BayesWavePost` ->
+`megaplot.py`), submitted to and run by a real (disposable, in-container) HTCondor pool,
+against real (trimmed, ~32s) GW150914 H1 GWOSC strain vendored into
+`tests/test_data/frames/`. It waits for and validates a genuine, parseable
+`glitch_median_PSD_forLI_H1.dat` — the same file `detect_completion()`/`collect_assets()`
+themselves look for — not just "the DAG was submitted", and separately checks that a
+production reaches a genuinely finished/uploaded state and that the missing
+`convert_psd_ascii2xml` tool (see "Operational notes" above) is handled gracefully. It's
+what found several of the real bugs described in `CHANGELOG.md`.
 
 ## Contributing
 
