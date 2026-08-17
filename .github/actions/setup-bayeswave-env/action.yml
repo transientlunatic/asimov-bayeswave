@@ -71,14 +71,17 @@ runs:
         "$CONDA_PYTHON" -m pip install --force-reinstall -e ".[test]"
         # bayeswaveutils' megaplot.py does `import pkg_resources` (from
         # setuptools) at module load time. bayeswaveutils' own conda-forge
-        # recipe declares a `setuptools<82` dependency, but ensurepip's
-        # bootstrapped pip (invoked above) no longer bundles setuptools by
-        # default -- confirmed by a real e2e run failing with
-        # "ModuleNotFoundError: No module named 'pkg_resources'" from
-        # inside a real HTCondor-run megaplot.py job. Install it explicitly
-        # as a final, defensive step so nothing upstream of this can
-        # silently leave it missing.
-        "$CONDA_PYTHON" -m pip install setuptools
+        # recipe declares a `setuptools<82` dependency for exactly this
+        # reason: setuptools has been dropping the deprecated pkg_resources
+        # module in recent releases. ensurepip's bootstrapped pip (invoked
+        # above) no longer bundles setuptools by default, so an earlier fix
+        # here added a bare `pip install setuptools` -- but confirmed by a
+        # second real e2e run, that resolves to whatever is latest
+        # (observed: 84.0.0), which no longer ships pkg_resources at all,
+        # so megaplot.py failed with the exact same
+        # "ModuleNotFoundError: No module named 'pkg_resources'" anyway.
+        # Pin to the same ceiling bayeswaveutils' own recipe uses.
+        "$CONDA_PYTHON" -m pip install "setuptools<82"
         # Regular (non-editable) installs set explicit, world-readable
         # permissions from the wheel's RECORD; an editable install's
         # metadata (entry_points.txt etc.) is instead written fresh by pip
