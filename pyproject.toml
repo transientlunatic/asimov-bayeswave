@@ -59,6 +59,9 @@ bayeswave = "asimov_bayeswave:BayesWave"
 [tool.setuptools]
 packages = ["asimov_bayeswave"]
 
+[tool.setuptools.package-data]
+asimov_bayeswave = ["configs/*.ini"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

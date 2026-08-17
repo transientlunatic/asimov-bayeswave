@@ -3,17 +3,16 @@
 import configparser
 import glob
 import os
-import re
+import shutil
 import subprocess
 from shutil import copyfile, copytree
 
 import numpy as np
-
 from asimov import config
-from asimov.utils import set_directory
 from asimov.git import AsimovFileNotFound
 from asimov.pipeline import Pipeline, PipelineException
 from asimov.storage import AlreadyPresentException, Store
+from asimov.utils import set_directory
 
 
 class BayesWave(Pipeline):
@@ -62,8 +61,20 @@ class BayesWave(Pipeline):
             self.category = "analyses"
             self.logger.info("Assuming analyses directory.")
 
-        if not production.meta.get("quality", {}).get("lowest minimum frequency", None):
-            production.meta["quality"]["lowest minimum frequency"] = self.flow
+    @property
+    def config_template(self):
+        """
+        The path to the bundled Liquid ini template for this pipeline.
+
+        asimov's ``manage build`` step falls back to this property to
+        render a production's ini when one doesn't already exist in the
+        event repository (see ``Analysis.make_config``). Without this,
+        asimov would fall through to looking for
+        ``asimov/configs/bayeswave.ini`` inside asimov's own package,
+        which no longer exists now that BayesWave support has been
+        extracted into this standalone plugin.
+        """
+        return os.path.join(os.path.dirname(__file__), "configs", "bayeswave.ini")
 
     def build_dag(self, user=None, dryrun=False):
         """
@@ -112,25 +123,26 @@ class BayesWave(Pipeline):
                 gps_file = os.path.join("gpstime.txt")
 
         if self.production.event.repository:
-            ini = self.production.get_configuration()
-            if not user:
-                if self.production.get_meta("user"):
-                    user = self.production.get_meta("user")
-                else:
-                    user = ini._get_user()
-
-            ini.update_accounting(user)
-
-            if "queue" in self.production.meta:
-                queue = self.production.meta["queue"]
-            else:
-                queue = "Priority_PE"
-
-            ini.set_queue(queue)
-
-            ini.save()
-
-            ini = ini.ini_loc
+            # asimov.ini.RunConfiguration is now a bare wrapper around a
+            # ConfigParser (just `.ini_loc` and `.ini`) -- it no longer has
+            # `_get_user()`, `update_accounting()`, or `set_queue()` methods
+            # (these were trimmed from core when the LALInference-specific
+            # RunConfiguration API was cut down to the generic subset core
+            # still needs). Calling them here always raised AttributeError,
+            # so build_dag() previously crashed for essentially any
+            # production whose event has a git repository -- i.e. real
+            # usage. The accounting group and user are instead already
+            # baked into the ini by the Liquid config_template at render
+            # time (`accounting-group = {{ scheduler['accounting group']
+            # }}` / `accounting-group-user = {{ config['condor']['user']
+            # }}` in configs/bayeswave.ini), which runs in
+            # Analysis.make_config() before build_dag() is ever called; no
+            # further mutation is needed or, with the trimmed API,
+            # possible. `user`/`queue` production.meta are accepted for
+            # backwards compatibility but no longer have anywhere to go --
+            # there is also no "queue" concept anywhere in bayeswave_pipe's
+            # own ini schema.
+            ini = self.production.get_configuration().ini_loc
 
         else:
             ini = f"{self.production.name}.ini"
@@ -147,12 +159,27 @@ class BayesWave(Pipeline):
 
         gps_time = self.production.get_meta("event time")
 
-        pipe_cmd = os.path.join(
+        # Resolve the bayeswave_pipe executable defensively rather than
+        # assuming config["pipelines"]["environment"]/bin/bayeswave_pipe
+        # exists: in minimal/containerised environments (e.g. the
+        # htcondor/mini container used for e2e testing) that config value
+        # may not point at the active environment. shutil.which() also
+        # picks up an explicit per-production override via
+        # production.meta["executable"], matching the approach adopted
+        # upstream to allow bayeswave_pipe to run inside containers.
+        default_executable = os.path.join(
             config.get("pipelines", "environment"), "bin", "bayeswave_pipe"
         )
+        executable = self.production.meta.get("executable", default_executable)
+        executable = shutil.which(executable) or shutil.which("bayeswave_pipe")
+        if executable is None:
+            raise PipelineException(
+                "Cannot find the bayeswave_pipe executable",
+                production=self.production.name,
+            )
 
         command = [
-            pipe_cmd,
+            executable,
             f"--trigger-time={gps_time}",
         ]
 
@@ -160,6 +187,9 @@ class BayesWave(Pipeline):
             if len(self.production.meta["data"]["cache files"]) > 0:
                 # Skip the datafind step if the data is already provided.
                 command += ["--skip-datafind"]
+                self.logger.info(
+                    f"Using cache files: {self.production.meta['data']['cache files']}"
+                )
 
         if "copy frames" in self.production.meta["scheduler"]:
             if self.production.meta["scheduler"]["copy frames"]:
@@ -169,11 +199,14 @@ class BayesWave(Pipeline):
             if self.production.meta["scheduler"]["osg"]:
                 command += ["--transfer-files"]
 
+                # --osg-deploy was renamed --igwn-pool upstream; the old
+                # flag still works but bayeswave_pipe itself now reports it
+                # as "OUTDATED. please use --igwn-pool instead."
                 if "copy frames" not in self.production.meta["scheduler"]:
-                    command += ["--osg-deploy"]
+                    command += ["--igwn-pool"]
                 if "copy frames" in self.production.meta["scheduler"]:
                     if not self.production.meta["scheduler"]["copy frames"]:
-                        command += ["--osg-deploy"]
+                        command += ["--igwn-pool"]
 
         command += [
             "-r",
@@ -189,13 +222,17 @@ class BayesWave(Pipeline):
             pipe = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
             )
-            out, err = pipe.communicate()
+            # stderr is merged into stdout above, so communicate()'s second
+            # element is always empty -- everything is in `out`.
+            out, _ = pipe.communicate()
             if "To submit:" not in str(out):
                 self.production.status = "stuck"
                 self.logger.error("Could not create a DAG file")
-                self.logger.info(f"{command}")
-                self.logger.debug(out)
-                self.logger.debug(err)
+                self.logger.error(f"Command: {' '.join(command)}")
+                self.logger.error(
+                    "bayeswave_pipe output:\n"
+                    f"{out.decode('utf-8', errors='replace') if isinstance(out, bytes) else out}"
+                )
                 raise PipelineException("The DAG file could not be created.")
             else:
                 self.logger.info("DAG file created")
@@ -242,21 +279,37 @@ class BayesWave(Pipeline):
             f"{ifo}",
         ]
         self.logger.info(" ".join(command))
-        pipe = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
-        out, err = pipe.communicate()
+        try:
+            pipe = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            )
+        except FileNotFoundError as e:
+            # convert_psd_ascii2xml is not shipped by any current public
+            # conda-forge package (checked bayeswave, bayeswaveutils,
+            # lalinference and lalapps) -- it may only be available in
+            # IGWN-internal environments. Fail clearly rather than letting
+            # a bare FileNotFoundError propagate; the ascii-format PSD from
+            # collect_assets() is still produced and stored regardless.
+            raise PipelineException(
+                "The convert_psd_ascii2xml executable could not be found; "
+                "no XML-format PSD was produced (the ascii-format PSD is "
+                "still available).",
+                production=self.production.name,
+            ) from e
 
-        if err:
+        out, _ = pipe.communicate()
+
+        # stderr is merged into stdout above (stderr=subprocess.STDOUT), so
+        # communicate()'s second element is always empty. The previous
+        # implementation branched on that always-empty value, so it could
+        # never actually detect a failed conversion. Use the process's real
+        # exit status instead.
+        if pipe.returncode != 0:
             self.production.status = "stuck"
-            if hasattr(self.production.event, "issue_object"):
-                raise Exception(
-                    f"An XML format PSD could not be created.\n{command}\n{out}\n\n{err}",
-                )
-            else:
-                raise Exception(
-                    f"An XML format PSD could not be created.\n{command}\n{out}\n\n{err} ",
-                )
+            raise PipelineException(
+                f"An XML format PSD could not be created.\n{command}\n{out}",
+                production=self.production.name,
+            )
         else:
             asset = f"{ifo.upper()}-psd.xml.gz"
             git_location = os.path.join(
@@ -286,7 +339,11 @@ class BayesWave(Pipeline):
 
         try:
             self.collect_pages()
-        except FileNotFoundError as e:
+        except (FileNotFoundError, IndexError) as e:
+            # IndexError is raised by collect_pages() if no trigtime_*
+            # directory exists yet (e.g. the megaplot DAG node hasn't
+            # completed even though the PSD files detect_completion() looks
+            # for already have); treat it the same as a missing file.
             self.logger.error("Failed to copy the megaplot output")
             self.logger.exception(e)
 
@@ -297,7 +354,7 @@ class BayesWave(Pipeline):
             self.logger.error("Failed to store the PSDs")
             self.logger.exception(e)
 
-        if "supress" in self.production.meta["quality"]:
+        if "supress" in self.production.meta.get("quality", {}):
             for ifo in self.production.meta["quality"]["supress"]:
                 if ifo in self.production.meta["interferometers"]:
                     self.supress_psd(
@@ -323,8 +380,33 @@ class BayesWave(Pipeline):
         -------
         float
             The minimum frequency across all interferometers.
+
+        Raises
+        ------
+        ValueError
+            If ``likelihood.minimum frequency`` isn't present as a
+            non-empty per-interferometer dictionary in the production's
+            metadata.
+
+        Note
+        ----
+        This is computed fresh from ``production.meta`` on every access
+        rather than cached, and deliberately not called during
+        ``__init__``: pipeline construction happens inside
+        ``Analysis.__init__``, before ``GravitationalWaveTransient``'s own
+        ``quality`` -> ``likelihood`` migration for a deprecated
+        ``quality.minimum frequency`` blueprint runs. An eager read here
+        would see the pre-migration state and could raise even for a
+        blueprint asimov itself will happily migrate and accept.
         """
-        return min(self.production.meta.get("likelihood", {}).get("minimum frequency", 0).values())
+        likelihood = self.production.meta.get("likelihood", {})
+        min_freq = likelihood.get("minimum frequency")
+        if not isinstance(min_freq, dict) or not min_freq:
+            raise ValueError(
+                "Minimum frequency must be specified in the 'likelihood' section. "
+                "Please update your blueprint to include 'minimum frequency' in 'likelihood'."
+            )
+        return min(min_freq.values())
 
     def before_submit(self):
         """
@@ -353,7 +435,7 @@ class BayesWave(Pipeline):
 
     def submit_dag(self, dryrun=False):
         """
-        Submit a DAG file to the condor cluster.
+        Submit a DAG file to the scheduler.
 
         Parameters
         ----------
@@ -373,50 +455,52 @@ class BayesWave(Pipeline):
         """
         self.before_submit()
 
-        command = [
-            "condor_submit_dag",
-            "-batch-name",
-            f"bwave/{self.production.event.name}/{self.production.name}",
-            f"{self.production.name}.dag",
-        ]
+        # bayeswave_pipe names the generated top-level DAG file after the
+        # basename of the --workdir it was given (see
+        # `dagname = os.path.join(workdir, os.path.basename(workdir))` in
+        # bayeswave_pipe itself), not after the production name directly.
+        # These are the same string under asimov's own default rundir
+        # convention (rundir = .../<event>/<production.name>), but computing
+        # it from the actual rundir is correct even if that convention is
+        # overridden.
+        dag_filename = f"{os.path.basename(self.production.rundir)}.dag"
+        batch_name = f"bwave/{self.production.event.name}/{self.production.name}"
 
-        self.logger.info((" ".join(command)))
+        self.logger.info(
+            f"Submitting DAG: {dag_filename} with batch name: {batch_name}"
+        )
 
         if dryrun:
-            print(" ".join(command))
+            print(f"Would submit DAG: {dag_filename} with batch name: {batch_name}")
 
         else:
             with set_directory(self.production.rundir):
                 try:
-                    dagman = subprocess.Popen(
-                        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                    # Use asimov's scheduler abstraction (HTCondor or Slurm)
+                    # rather than shelling out to condor_submit_dag directly.
+                    cluster_id = self.scheduler.submit_dag(
+                        dag_file=dag_filename,
+                        batch_name=batch_name,
                     )
+
+                    self.production.status = "running"
+                    self.production.job_id = int(cluster_id)
+                    self.logger.info(
+                        f"Successfully submitted to cluster {self.production.job_id}"
+                    )
+                    return (int(cluster_id),)
+
                 except FileNotFoundError as e:
                     self.logger.exception(e)
                     raise PipelineException(
-                        "It looks like condor isn't installed on this system.\n"
-                        f"""I wanted to run {" ".join(command)}."""
+                        "It looks like the scheduler isn't properly configured.\n"
+                        f"Failed to submit DAG file: {dag_filename}"
                     ) from e
-
-                stdout, stderr = dagman.communicate()
-
-            if "submitted to cluster" in str(stdout):
-                cluster = re.search(
-                    r"submitted to cluster ([\d]+)", str(stdout)
-                ).groups()[0]
-                self.production.status = "running"
-                self.production.job_id = int(cluster)
-                self.logger.info(
-                    f"Successfully submitted to cluster {self.production.job_id}"
-                )
-                self.logger.debug(stdout)
-                return (int(cluster),)
-            else:
-                self.logger.info(stdout)
-                self.logger.error(stderr)
-                raise PipelineException(
-                    f"The DAG file could not be submitted.\n\n{stdout}\n\n{stderr}",
-                )
+                except RuntimeError as e:
+                    self.logger.exception(e)
+                    raise PipelineException(
+                        f"The DAG file could not be submitted: {e}",
+                    ) from e
 
     def upload_assets(self):
         """
@@ -425,7 +509,7 @@ class BayesWave(Pipeline):
         sample = self.production.meta["likelihood"]["sample rate"]
         git_location = os.path.join(self.category, "psds")
 
-        for detector, asset in self.collect_assets()["psds"]:
+        for detector, asset in self.collect_assets()["psds"].items():
             self.production.event.repository.add_file(
                 asset,
                 os.path.join(git_location, str(sample), f"{detector}-psd.dat"),
@@ -468,7 +552,7 @@ class BayesWave(Pipeline):
         messages = {}
 
         logfile = os.path.join(
-            config.get("logging", "directory"),
+            config.get("logging", "location"),
             self.production.event.name,
             self.production.name,
             "asimov.log",
@@ -501,7 +585,17 @@ class BayesWave(Pipeline):
         """
         psds = {}
         for det in self.production.meta["interferometers"]:
-            asset = glob.glob(
+            # NOTE: this glob legitimately returns [] on every poll before
+            # the run completes -- that's the whole point of
+            # detect_completion() calling this repeatedly. A previous
+            # version of this loop left `asset` as that empty list and then
+            # called os.path.exists(asset) unconditionally, which raises
+            # TypeError (os.path.exists only accepts a path, not a list) --
+            # i.e. it crashed on every single monitoring poll prior to
+            # completion, not just at the end. Existing unit tests never
+            # caught this because they mock os.path.exists to always return
+            # True. Guard explicitly instead.
+            matches = glob.glob(
                 os.path.join(
                     self.production.rundir,
                     "trigtime*",
@@ -510,10 +604,8 @@ class BayesWave(Pipeline):
                     f"glitch_median_PSD_forLI_{det}.dat",
                 )
             )
-            if len(asset) > 0:
-                asset = asset[0]
-            if os.path.exists(asset):
-                psds[det] = asset
+            if matches and os.path.exists(matches[0]):
+                psds[det] = matches[0]
 
         outputs = {}
         outputs["psds"] = psds
