@@ -110,6 +110,16 @@ jobs:
       # placeholder is substituted rather than layering a second `kind:
       # event` apply on top (the latter doesn't merge; asimov silently
       # no-ops a second apply of an existing event name).
+      # NOTE: etive-io/actions/run-asimov-command@v1 feeds this whole
+      # script to `su - submituser <<SUBMITUSER ... SUBMITUSER` with an
+      # *unquoted* heredoc delimiter, so bash expands any $VARIABLEs in it
+      # once, up front, in the outer (root) shell -- before the `cd
+      # e2e_project` line below has actually been executed by anyone.
+      # $GITHUB_WORKSPACE is safe (a real, stable job-level env var), but
+      # $PWD is not: it would resolve to the outer shell's cwd
+      # ($GITHUB_WORKSPACE itself), not e2e_project, silently producing a
+      # cache-file path missing its /e2e_project/ segment. Always build
+      # absolute paths from $GITHUB_WORKSPACE here instead of $PWD.
       - name: Generate the LAL-cache fixture and apply the fake event
         uses: etive-io/actions/run-asimov-command@v1
         with:
@@ -118,7 +128,7 @@ jobs:
             mkdir -p cache
             printf 'H\tH1_GWOSC_16KHZ_R1\t1126259447\t32\tfile://localhost%s/tests/test_data/frames/H-H1_GWOSC_16KHZ_R1-1126259447-32.gwf\n' \
               "$GITHUB_WORKSPACE" > cache/H1.cache
-            sed "s|H1_CACHE_FILE_PLACEHOLDER|$PWD/cache/H1.cache|" \
+            sed "s|H1_CACHE_FILE_PLACEHOLDER|$GITHUB_WORKSPACE/e2e_project/cache/H1.cache|" \
               "$GITHUB_WORKSPACE/tests/test_blueprints/fake_event.yaml" > /tmp/fake_event_resolved.yaml
             asimov apply -f /tmp/fake_event_resolved.yaml
 
