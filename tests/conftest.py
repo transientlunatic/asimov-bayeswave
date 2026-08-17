@@ -3,6 +3,7 @@
 import os
 import tempfile
 from unittest.mock import MagicMock, Mock
+
 import pytest
 
 
@@ -23,7 +24,13 @@ def mock_production():
     production.event.repository = MagicMock()
     production.event.repository.directory = "/tmp/test_repo"
 
-    # Mock metadata
+    # Mock metadata. "minimum frequency" lives under "likelihood" -- this is
+    # the canonical, post-migration location that BayesWave.flow reads (see
+    # asimov_bayeswave.bayeswave.BayesWave.flow). A production's meta only
+    # ever contains the deprecated "quality.minimum frequency" location
+    # transiently, before GravitationalWaveTransient.__init__ migrates it;
+    # by the time a pipeline object's methods (other than __init__ itself)
+    # run, it should already be under "likelihood".
     production.meta = {
         "event time": 1126259462.4,
         "interferometers": ["H1", "L1"],
@@ -31,6 +38,7 @@ def mock_production():
             "sample rate": 2048,
             "segment length": 8,
             "segment start": -4,
+            "minimum frequency": {"H1": 20, "L1": 20},
         },
         "data": {
             "channels": {
@@ -44,9 +52,7 @@ def mock_production():
             "cache files": {},
             "segment length": 8,
         },
-        "quality": {
-            "minimum frequency": {"H1": 20, "L1": 20},
-        },
+        "quality": {},
         "scheduler": {
             "accounting group": "ligo.dev.o4.cbc.pe.bayeswave",
         },
@@ -65,7 +71,12 @@ def mock_config(monkeypatch):
         ("general", "rundir_default"): "/tmp/run",
         ("general", "webroot"): "/tmp/web",
         ("pipelines", "environment"): "/opt/conda",
-        ("logging", "directory"): "/tmp/logs",
+        # "location" is the real asimov.conf key under [logging] (see
+        # asimov/asimov.conf and asimov/__init__.py / project.py / analysis.py,
+        # which all read config.get("logging", "location")). "directory" is
+        # not a real key -- kept here too only so a test can assert the old,
+        # wrong key is no longer what collect_logs() reads.
+        ("logging", "location"): "/tmp/logs",
         ("storage", "directory"): "/tmp/storage",
         ("condor", "user"): "test.user",
     }
